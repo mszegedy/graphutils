@@ -143,84 +143,6 @@ class AlignmentSet:
         self.__parent_node = parent_node # name of an aligned node
         # alignments should be a collection of names of aligned nodes
         self.__alignments = frozenset(alignments)
-    @classmethod
-    def all_from_children(cls, parent_node, lhs_children, rhs_children):
-        ## trivial cases
-        key = (parent_alignment,
-               frozenset(lhs_children),
-               frozenset(rhs_children))
-        if key in cls.cache:
-            return cls.cache[key]
-        if len(lhs_children) == 0 and len(rhs_children) == 0:
-            cls.cache[key] = frozenset()
-            return cls.cache[key]
-        if len(lhs_children) == 0:
-            cls.cache[key] = frozenset({
-                AlignmentSet(parent_node,
-                             frozenset((consts.GAP, node) \
-                                       for node in rhs_children))})
-            return cls.cache[key]
-        if len(rhs_children) == 0:
-            cls.cache[key] = frozenset({
-                AlignmentSet(parent_node,
-                             frozenset((node, consts.GAP) \
-                                       for node in lhs_children))})
-            return cls.cache[key]
-
-        ## reorder sets into larger and smaller (can be equal size)
-        if len(lhs_children) >= len(rhs_children):
-            l_set  = lhs_children # larger set
-            s_set  = rhs_children # smaller set
-            switch = lambda x,y: (x,y) # switch back to lhs, rhs
-        else:
-            l_set  = rhs_children # larger set
-            s_set  = lhs_children # smaller set
-            switch = lambda x,y: (y,x) # switch back to lhs, rhs
-        ## construct and collect every possible alignment set
-        alignment_sets = {}
-        # every loop variable:
-        #     matched_s_set:   s_set nodes aligned to l_set nodes
-        #     us_gapped_s_set: s_set nodes aligned to gaps upstream from l_set
-        #         nodes
-        #     ds_gapped_s_set: s_set nodes aligned to gaps downstream from
-        #         parent node
-        #     unmatched_s_set: s_set nodes not aligned to anything, because
-        #         l_set nodes were aligned to gaps upstream from them
-        # l_set loop variables correspond to the same things for l_set.
-        for matched_s_set, us_gapped_s_set, ds_gapped_s_set, unmatched_s_set \
-        in itertools.chain \
-                    .from_iterable(itertools.permutations(partition) \
-                                   for partition \
-                                   in partitions(s_set, 4, non_empty_p=False)):
-            for matched_l_set, us_gapped_l_set, ds_gapped_l_set,
-                unmatched_l_set \
-            in exact_partitions(l_set, (len(matched_s_set),
-                                        len(unmatched_s_set),
-                                        len(l_set)-(len(matched_s_set) + \
-                                                    len(unmatched_s_set) + \
-                                                    len(us_gapped_s_set)),
-                                        len(us_gapped_s_set))):
-                alignments = {}
-                for lhs_node, rhs_node in zip(*switch(matched_l_set,
-                                                      matched_s_set)):
-                    alignments.add(switch(lhs_node, rhs_node))
-                # dunno what to do with unaligned nodes yet
-                for aligned_node, unaligned_node in zip(us_gapped_l_set,
-                                                        unmatched_s_set):
-                    alignments.add(switch(aligned_node, None))
-                for aligned_node, unaligned_node in zip(us_gapped_s_set,
-                                                        unmatched_l_set):
-                    alignments.add(switch(None, aligned_node))
-                ds_gapped_lhs_set, ds_gapped_rhs_set = \
-                    switch(ds_gapped_l_set, ds_gapped_s_set)
-                for node in ds_gapped_lhs_set:
-                    alignments.add((node, None))
-                for node in ds_gapped_rhs_set:
-                    alignments.add((None, node))
-                alignment_sets.add(AlignmentSet(parent_node, alignments))
-        # key was calculated at the beginning
-        cls.cache[key] = frozenset(alignment_sets)
-        return cls.cache[key]
     def __len__(self):
         return len(self.__alignments)
     def __iter__(self):
@@ -334,6 +256,89 @@ class AlignmentTree:
         self.lhs_g = lhs_g
         self.rhs_g = rhs_g
         self.scorefxn = scorefxn
-        # maps TreeNodes to a list of scores for each, where 
+        # maps TreeNodes to a tuple of scores for each, where the tuple lists
+        # the scores of the TreeNode's parents in order of descent, ending with
+        # the score of the TreeNode itself
         self.tree_node_scores = {}
-    def tree_nodes_from_branch
+    def tree_nodes_from_branch(self, branch):
+        '''Returns the set of daughter tree nodes from a branch, each having the
+        parent that gives it the highest score.'''
+        ## copied from above; needs to be rewritten completely, partially to be
+        ## magic and always know the parents that give the highest score
+
+        ## trivial cases
+        key = (parent_alignment,
+               frozenset(lhs_children),
+               frozenset(rhs_children))
+        if key in cls.cache:
+            return cls.cache[key]
+        if len(lhs_children) == 0 and len(rhs_children) == 0:
+            cls.cache[key] = frozenset()
+            return cls.cache[key]
+        if len(lhs_children) == 0:
+            cls.cache[key] = frozenset({
+                AlignmentSet(parent_node,
+                             frozenset((consts.GAP, node) \
+                                       for node in rhs_children))})
+            return cls.cache[key]
+        if len(rhs_children) == 0:
+            cls.cache[key] = frozenset({
+                AlignmentSet(parent_node,
+                             frozenset((node, consts.GAP) \
+                                       for node in lhs_children))})
+            return cls.cache[key]
+
+        ## reorder sets into larger and smaller (can be equal size)
+        if len(lhs_children) >= len(rhs_children):
+            l_set  = lhs_children # larger set
+            s_set  = rhs_children # smaller set
+            switch = lambda x,y: (x,y) # switch back to lhs, rhs
+        else:
+            l_set  = rhs_children # larger set
+            s_set  = lhs_children # smaller set
+            switch = lambda x,y: (y,x) # switch back to lhs, rhs
+        ## construct and collect every possible alignment set
+        alignment_sets = {}
+        # every loop variable:
+        #     matched_s_set:   s_set nodes aligned to l_set nodes
+        #     us_gapped_s_set: s_set nodes aligned to gaps upstream from l_set
+        #         nodes
+        #     ds_gapped_s_set: s_set nodes aligned to gaps downstream from
+        #         parent node
+        #     unmatched_s_set: s_set nodes not aligned to anything, because
+        #         l_set nodes were aligned to gaps upstream from them
+        # l_set loop variables correspond to the same things for l_set.
+        for matched_s_set, us_gapped_s_set, ds_gapped_s_set, unmatched_s_set \
+        in itertools.chain \
+                    .from_iterable(itertools.permutations(partition) \
+                                   for partition \
+                                   in partitions(s_set, 4, non_empty_p=False)):
+            for matched_l_set, us_gapped_l_set, ds_gapped_l_set,
+                unmatched_l_set \
+            in exact_partitions(l_set, (len(matched_s_set),
+                                        len(unmatched_s_set),
+                                        len(l_set)-(len(matched_s_set) + \
+                                                    len(unmatched_s_set) + \
+                                                    len(us_gapped_s_set)),
+                                        len(us_gapped_s_set))):
+                alignments = {}
+                for lhs_node, rhs_node in zip(*switch(matched_l_set,
+                                                      matched_s_set)):
+                    alignments.add(switch(lhs_node, rhs_node))
+                # dunno what to do with unaligned nodes yet
+                for aligned_node, unaligned_node in zip(us_gapped_l_set,
+                                                        unmatched_s_set):
+                    alignments.add(switch(aligned_node, None))
+                for aligned_node, unaligned_node in zip(us_gapped_s_set,
+                                                        unmatched_l_set):
+                    alignments.add(switch(None, aligned_node))
+                ds_gapped_lhs_set, ds_gapped_rhs_set = \
+                    switch(ds_gapped_l_set, ds_gapped_s_set)
+                for node in ds_gapped_lhs_set:
+                    alignments.add((node, None))
+                for node in ds_gapped_rhs_set:
+                    alignments.add((None, node))
+                alignment_sets.add(AlignmentSet(parent_node, alignments))
+        # key was calculated at the beginning
+        cls.cache[key] = frozenset(alignment_sets)
+        return cls.cache[key]
