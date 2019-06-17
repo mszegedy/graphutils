@@ -16,6 +16,7 @@ two graphs.'''
 
 import itertools
 from functools import reduce
+import queue
 import networkx as nx
 import consts
 
@@ -117,6 +118,27 @@ def exact_partitions(ns, m_list):
         yield [list(next(iter_permutation) for _ in range(m)) \
                for m in m_list]
 
+def tree_from_graph(g, start_node):
+    '''Make a minimum depth, tree-shaped digraph out of a normal graph, with
+    start_node as the root.'''
+    # apparently recursion is inefficient in Python, so we're gonna
+    # take the long and boring route with a list accumulator
+    tree = nx.DiGraph()
+    tree.add_node(start_node, **g[start_node])
+    # using queue.Queue here because I might wanna parallelize in the
+    # future
+    to_expand = queue.Queue()
+    to_expand.put(start_node)
+    while to_expand.qsize() != 0:
+        node = to_expand.get()
+        for child in g[node]:
+            if child not in tree:
+                tree.add_node(child, **g[child])
+                tree.add_edge(node, child)
+                to_expand.put(child)
+        to_expand.task_done()
+    return tree
+
 def default_scorefxn(node, lhs_g, rhs_g, caching=True):
     '''Give a score for an alignment of two nodes. This scorefxn gives 1 for a
     match, 0 for a non-match, and -1 for gaps.'''
@@ -125,7 +147,7 @@ def default_scorefxn(node, lhs_g, rhs_g, caching=True):
     ret = None
     if consts.GAP in node:
         ret = -1
-    elif lhs_g[node[0]] == rhs_g[node[1]]:
+    elif lhs_g[node.lhs] == rhs_g[node.rhs]:
         ret = 1
     else:
         ret = 0
@@ -135,14 +157,13 @@ def default_scorefxn(node, lhs_g, rhs_g, caching=True):
 default_scorefxn.cache = {}
 
 class AlignmentSet:
-    '''An immutable, unordered collection of aligned nodes, where an aligned
-    node is a 2-tuple of two unique node names, or one unique node name on
-    either side and a consts.GAP on the other.'''
+    '''An immutable, unordered collection of AlignedNodes.'''
     cache = {}
-    def __init__(self, parent_node, alignments):
-        self.__parent_node = parent_node # name of an aligned node
+    def __init__(self, alignments):
         # alignments should be a collection of names of aligned nodes
         self.__alignments = frozenset(alignments)
+    def __eq__(self, other):
+        return self.__alignments == other.alignments
     def __len__(self):
         return len(self.__alignments)
     def __iter__(self):
@@ -150,21 +171,18 @@ class AlignmentSet:
     def __contains__(self, item):
         return item in self.__alignments
     def __hash__(self):
-        return hash((self.__parent_node, self.__alignments))
-    @property
-    def parent_node(self):
-        return self.__parent_node
+        return hash(self.__alignments)
     @property
     def alignments(self):
         return self.__alignments
     @property
     def lhs_children(self):
         '''Return generating lhs_children.'''
-        return frozenset(a[0] for a in self.__alignments if a[0] != consts.GAP)
+        return frozenset(a.lhs for a in self.__alignments if a.lhs != consts.GAP)
     @property
     def rhs_children(self):
         '''Return generating rhs_children.'''
-        return frozenset(a[1] for a in self.__alignments if a[1] != consts.GAP)
+        return frozenset(a.rhs for a in self.__alignments if a.rhs != consts.GAP)
     @property
     def siblings(self):
         '''All other AlignmentSets with the same lhs_children and
@@ -173,6 +191,9 @@ class AlignmentSet:
                                               self.lhs_children,
                                               self.rhs_children) \
                            .difference({self})
+    def is_sibling(self, other):
+        return self.lhs_children == other.lhs_children and \
+               self.rhs_children == other.rhs_children
     def union(self, other_as):
         '''Combine this AlignmentSet with another one and return the result.
         Note that, unlike set unions, this isn't a symmetric operation, as the
@@ -183,6 +204,10 @@ class AlignmentSet:
                             self.__alignments.union(other_as.alignments))
 
 class AlignedNode:
+    '''An atomic pair of two aligned nodes: one from the left-hand-side graph,
+    and one from the right-hand-side graph. One is permitted to be consts.GAP.
+    Additionally, the gap is permitted to be given a node that it is upstream
+    of.'''
     def __init__(self, lhs_node, rhs_node, *, lhs_upstream_of=None,
                  rhs_upstream_of=None):
         self.lhs = lhs_node
@@ -225,8 +250,9 @@ class Branch:
                      self.__alignments))
 
 class TreeNode:
-    '''Node for the alignment tree.'''
-    def __init__(self, parent_branch, alignment_set, parent_tree_node):
+    '''Node for the alignment tree, used as a key to map pieces of alignments
+    to branches (which then map to more pieces of alignments, etc).'''
+    def __init__(self, parent_branch, alignment_set, parent_tree_node, score):
         # branch whose expansion led to this node:
         self.__parent_branch = parent_branch
         # alignment set from the different possible alignments of the parent
@@ -235,6 +261,7 @@ class TreeNode:
         # union of alignments of the entire ancestry of this node:
         self.__total_alignment_set = parent_tree_node.total_alignment_set \
                                                      .union(alignment_set)
+        self.__scores = parent_tree_node.scores + (score,)
     @property
     def parent_branch(self):
         return self.__parent_branch
@@ -244,101 +271,165 @@ class TreeNode:
     @property
     def total_alignment_set(self):
         return self.__total_alignment_set
+    @property
+    def scores(self):
+        return self.__scores
     def __hash__(self):
-        return hash(self.__parent_branch,
-                    self.__alignment_set,
-                    self.__total_alignment_set)
+        return hash((self.__parent_branch,
+                     self.__alignment_set,
+                     self.__total_alignment_set))
+
+class StartingTreeNode(TreeNode):
+    '''Root node for alignment tree.'''
+    def __init__(self, start_node):
+        self.__parent_branch = None
+        self.__alignment_set = AlignmentSet({start_node})
+        self.__total_alignment_set = self.__alignment_set
+        self.__scores = ()
 
 class AlignmentTree:
-    def __init__(self, lhs_g, rhs_g, start_node, scorefxn=default_scorefxn):
+    def __init__(self, lhs_g, rhs_g, lhs_start, rhs_start,
+                 scorefxn=default_scorefxn):
         '''Constructs and scores an entire alignment tree between two graphs,
         for a specified starting aligned node, and a given scorefxn.'''
         self.lhs_g = lhs_g
         self.rhs_g = rhs_g
+        self.start_node = AlignNode(lhs_start, rhs_start)
         self.scorefxn = scorefxn
-        # maps TreeNodes to a tuple of scores for each, where the tuple lists
-        # the scores of the TreeNode's parents in order of descent, ending with
-        # the score of the TreeNode itself
-        self.tree_node_scores = {}
-    def tree_nodes_from_branch(self, branch):
-        '''Returns the set of daughter tree nodes from a branch, each having the
-        parent that gives it the highest score.'''
-        ## copied from above; needs to be rewritten completely, partially to be
-        ## magic and always know the parents that give the highest score
-
-        ## trivial cases
-        key = (parent_alignment,
-               frozenset(lhs_children),
-               frozenset(rhs_children))
-        if key in cls.cache:
-            return cls.cache[key]
-        if len(lhs_children) == 0 and len(rhs_children) == 0:
-            cls.cache[key] = frozenset()
-            return cls.cache[key]
-        if len(lhs_children) == 0:
-            cls.cache[key] = frozenset({
-                AlignmentSet(parent_node,
-                             frozenset((consts.GAP, node) \
-                                       for node in rhs_children))})
-            return cls.cache[key]
-        if len(rhs_children) == 0:
-            cls.cache[key] = frozenset({
-                AlignmentSet(parent_node,
-                             frozenset((node, consts.GAP) \
-                                       for node in lhs_children))})
-            return cls.cache[key]
-
-        ## reorder sets into larger and smaller (can be equal size)
-        if len(lhs_children) >= len(rhs_children):
-            l_set  = lhs_children # larger set
-            s_set  = rhs_children # smaller set
-            switch = lambda x,y: (x,y) # switch back to lhs, rhs
+        self.root = StartingTreeNode(self.start_node)
+        self.branches_to_nodes = {} # Branch -> {AlignmentSet -> TreeNode}
+        self.nodes_to_branches = {} # TreeNode -> {AlignedNode -> Branch}
+    def expand_node(self, node):
+        '''Adds the daughter branches of a particular node to
+        .nodes_to_branches, and then the daughter nodes of those branches to
+        .branches_to_nodes. Returns the daughter nodes.'''
+        ### construct .nodes_to_branches (both levels)
+        try:
+            branch_dict = self.nodes_to_branches[node]
+        except KeyError:
+            branch_dict = {}
+            for aligned_node in node.alignments:
+                lhs_successors = self.lhs_tree.successors(aligned_node.lhs)
+                rhs_successors = self.rhs_tree.successors(aligned_node.rhs)
+                branch_dict[aligned_node] = \
+                    Branch(aligned_node,
+                           lhs_successors,
+                           rhs_successors,
+                           AlignmentSet(
+                               {alignment \
+                                for alignment \
+                                in node.total_alignments \
+                                if (alignment.lhs in lhs_successors) or \
+                                   (alignment.rhs in rhs_successors)}))
+            self.nodes_to_branches[node] = branch_dict
+        ### construct .branches_to_nodes (both levels)
+        for branch in branch_dict.values():
+            ## reorder sets into larger and smaller (can be equal size)
+            lhs_children = branch.lhs_children
+            rhs_children = branch.rhs_children
+            if len(lhs_children) >= len(rhs_children):
+                l_set  = lhs_children # larger set
+                s_set  = rhs_children # smaller set
+                switch = lambda x,y: (x,y) # switch back to lhs, rhs
+            else:
+                l_set  = rhs_children # larger set
+                s_set  = lhs_children # smaller set
+                switch = lambda x,y: (y,x) # switch back to lhs, rhs
+            ## construct and collect every possible AlignmentSet
+            alignment_sets = set()
+            # every loop variable:
+            #     matched_s_set:   s_set nodes aligned to l_set nodes
+            #     us_gapped_s_set: s_set nodes aligned to gaps upstream from l_set
+            #         nodes
+            #     ds_gapped_s_set: s_set nodes aligned to gaps downstream from
+            #         parent node
+            #     unmatched_s_set: s_set nodes not aligned to anything, because
+            #         l_set nodes were aligned to gaps upstream from them
+            # l_set loop variables correspond to the same things for l_set.
+            for matched_s_set, us_gapped_s_set, ds_gapped_s_set,
+                unmatched_s_set \
+            in itertools.chain \
+                        .from_iterable(itertools.permutations(partition) \
+                                       for partition \
+                                       in partitions(s_set, 4,
+                                                     non_empty_p=False)):
+                for matched_l_set, us_gapped_l_set, ds_gapped_l_set,
+                    unmatched_l_set \
+                in exact_partitions(l_set, (len(matched_s_set),
+                                            len(unmatched_s_set),
+                                            len(l_set)-(len(matched_s_set) + \
+                                                        len(unmatched_s_set) + \
+                                                        len(us_gapped_s_set)),
+                                            len(us_gapped_s_set))):
+                    alignments = set()
+                    for lhs_node, rhs_node in zip(*switch(matched_l_set,
+                                                          matched_s_set)):
+                        alignments.add(AlignedNode(lhs_node, rhs_node))
+                    # dunno what to do with unaligned nodes yet
+                    for gapped_node, unmatched_node in zip(us_gapped_l_set,
+                                                           unmatched_s_set):
+                        lhs_upstream_from, rhs_upstream_from = \
+                            switch(None, unmatched_node)
+                        alignments.add(
+                            AlignedNode(*switch(gapped_node, consts.GAP),
+                                        lhs_upstream_from=lhs_upstream_from,
+                                        rhs_upstream_from=rhs_upstream_from))
+                    for gapped_node, unmatched_node in zip(us_gapped_s_set,
+                                                           unmatched_l_set):
+                        lhs_upstream_from, rhs_upstream_from = \
+                            switch(unmatched_node, None)
+                        alignments.add(
+                            AlignedNode(*switch(consts.GAP, gapped_node),
+                                        lhs_upstream_from=lhs_upstream_from,
+                                        rhs_upstream_from=rhs_upstream_from))
+                    ds_gapped_lhs_set, ds_gapped_rhs_set = \
+                        switch(ds_gapped_l_set, ds_gapped_s_set)
+                    for node in ds_gapped_lhs_set:
+                        alignments.add((node, consts.GAP))
+                    for node in ds_gapped_rhs_set:
+                        alignments.add((consts.GAP, node))
+                    alignment_sets.add(AlignmentSet(alignments))
+            ## for each AlignmentSet, 
+    @property
+    def lhs_tree(self):
+        if hasattr(self, '__lhs_tree'):
+            return self.__lhs_tree
         else:
-            l_set  = rhs_children # larger set
-            s_set  = lhs_children # smaller set
-            switch = lambda x,y: (y,x) # switch back to lhs, rhs
-        ## construct and collect every possible alignment set
-        alignment_sets = {}
-        # every loop variable:
-        #     matched_s_set:   s_set nodes aligned to l_set nodes
-        #     us_gapped_s_set: s_set nodes aligned to gaps upstream from l_set
-        #         nodes
-        #     ds_gapped_s_set: s_set nodes aligned to gaps downstream from
-        #         parent node
-        #     unmatched_s_set: s_set nodes not aligned to anything, because
-        #         l_set nodes were aligned to gaps upstream from them
-        # l_set loop variables correspond to the same things for l_set.
-        for matched_s_set, us_gapped_s_set, ds_gapped_s_set, unmatched_s_set \
-        in itertools.chain \
-                    .from_iterable(itertools.permutations(partition) \
-                                   for partition \
-                                   in partitions(s_set, 4, non_empty_p=False)):
-            for matched_l_set, us_gapped_l_set, ds_gapped_l_set,
-                unmatched_l_set \
-            in exact_partitions(l_set, (len(matched_s_set),
-                                        len(unmatched_s_set),
-                                        len(l_set)-(len(matched_s_set) + \
-                                                    len(unmatched_s_set) + \
-                                                    len(us_gapped_s_set)),
-                                        len(us_gapped_s_set))):
-                alignments = {}
-                for lhs_node, rhs_node in zip(*switch(matched_l_set,
-                                                      matched_s_set)):
-                    alignments.add(switch(lhs_node, rhs_node))
-                # dunno what to do with unaligned nodes yet
-                for aligned_node, unaligned_node in zip(us_gapped_l_set,
-                                                        unmatched_s_set):
-                    alignments.add(switch(aligned_node, None))
-                for aligned_node, unaligned_node in zip(us_gapped_s_set,
-                                                        unmatched_l_set):
-                    alignments.add(switch(None, aligned_node))
-                ds_gapped_lhs_set, ds_gapped_rhs_set = \
-                    switch(ds_gapped_l_set, ds_gapped_s_set)
-                for node in ds_gapped_lhs_set:
-                    alignments.add((node, None))
-                for node in ds_gapped_rhs_set:
-                    alignments.add((None, node))
-                alignment_sets.add(AlignmentSet(parent_node, alignments))
-        # key was calculated at the beginning
-        cls.cache[key] = frozenset(alignment_sets)
-        return cls.cache[key]
+            self.__lhs_tree = tree_from_graph(self.lhs_g, self.start_node.lhs)
+            return self.__lhs_tree
+    @property
+    def rhs_tree(self):
+        if hasattr(self, '__rhs_tree'):
+            return self.__rhs_tree
+        else:
+            self.__rhs_tree = tree_from_graph(self.rhs_g, self.start_node.rhs)
+            return self.__rhs_tree
+    def alignment(self):
+        ## 0. build tree through recursive expansion over each level of each
+        ##    tree
+        # because Python apparently sucks at recursion we're stuck with a good
+        # old-fashioned queue again
+        to_expand = queue.Queue()
+        to_expand.put(self.root)
+        while to_expand.qsize() != 0:
+            node = to_expand.get()
+            expansions = self.expand_node(node) # write this later
+            for child in expansions:
+                to_expand.put(child)
+            to_expand.task_done()
+        ## 1. get leaf with highest score
+        best_leaf = max(self.leaves, key=lambda n: sum(n.scores))
+        ## 2. collapse tree upwards, taking the highest-scoring expansions at
+        ##    each node
+        to_collapse = queue.Queue()
+        to_collapse.put(best_leaf)
+        current_highest_node = best_leaf
+        total_alignment = set()
+        while to_expand.qsize() != 0:
+            node = to_collapse.get()
+            for sibling in (sibling \
+                            for sibling \
+                            in self.branches_to_nodes[node.parent_branch] \
+                            if sibling != node):
+                pass
+            to_collapse.task_done()

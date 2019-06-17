@@ -1,0 +1,7 @@
+Part of the framework for an alignment algorithm that's supposed to find the
+minimum-penalty alignment of two graphs (node-for-node) where the score
+function is only a function of information stored on the nodes, not the edges
+themselves (but it is not allowed for the edges to be rearranged in the
+consensus graph, only for gap nodes to be inserted). It's meant to generalize
+algorithms such as Smith-Waterman and Needleman-Wunsch to any graph, not just
+lines. I never finished it, because it was hard.
